@@ -28,6 +28,7 @@ namespace
 
     set<int> gTechRequested;
     map<int, int> gLastOrderFrame;      // SN -> 最近一次发命令的帧
+    map<int, int> gCombatTargetSN;      // 战斗单位/箭塔当前锁定目标，避免反复重置寻路
 
     // ---------- 基础工具 ----------
     int countBuilding(const tagInfo &info, int type)
@@ -63,6 +64,14 @@ namespace
         int n = 0;
         for (const tagArmy &a : info.armies)
             if (a.Sort != AT_PRIEST) ++n;
+        return n;
+    }
+
+    int countArmyType(const tagInfo &info, int sort)
+    {
+        int n = 0;
+        for (const tagArmy &a : info.armies)
+            if (a.Sort == sort) ++n;
         return n;
     }
 
@@ -149,11 +158,41 @@ namespace
         const tagBuilding *center = findBuildingConst(info, BUILDING_CENTER);
         if (!center) return false;
 
-        const int cx = center->BlockDR;
-        const int cy = center->BlockUR;
+        int cx = center->BlockDR;
+        int cy = center->BlockUR;
+        int minRadius = 4;
+        int maxRadius = 24;
 
-        // 以市镇中心为圆心逐圈搜索，seed 让失败后的下一次从不同位置开始。
-        for (int radius = 4; radius <= 24; ++radius)
+        // 两座箭塔组成同一个防御核心：第一座靠近市镇中心，第二座紧贴第一座。
+        // 这样两塔可以同时接敌，士兵也不必在两个很远的防区之间来回跑。
+        if (type == BUILDING_ARROWTOWER)
+        {
+            const tagBuilding *firstTower = nullptr;
+            for (const tagBuilding &b : info.buildings)
+            {
+                if (b.Type == BUILDING_ARROWTOWER)
+                {
+                    firstTower = &b;
+                    break;
+                }
+            }
+
+            if (firstTower)
+            {
+                cx = firstTower->BlockDR;
+                cy = firstTower->BlockUR;
+                minRadius = 3;
+                maxRadius = 6;
+            }
+            else
+            {
+                minRadius = 4;
+                maxRadius = 8;
+            }
+        }
+
+        // 逐圈搜索，seed 让失败后的下一次从不同位置开始。
+        for (int radius = minRadius; radius <= maxRadius; ++radius)
         {
             for (int k = 0; k < 8 * radius; ++k)
             {
@@ -297,35 +336,51 @@ namespace
         int woodNow = currentWorkersOnType(info, RESOURCE_TREE);
         int stoneNow = currentWorkersOnType(info, RESOURCE_STONE);
         int goldNow = currentWorkersOnType(info, RESOURCE_GOLD);
+        int huntNow = currentWorkersOnType(info, RESOURCE_GAZELLE) +
+                      currentWorkersOnType(info, RESOURCE_ELEPHANT);
         int foodNow = currentWorkersOnType(info, RESOURCE_BUSH) +
-                      currentWorkersOnType(info, RESOURCE_GAZELLE) +
-                      currentWorkersOnType(info, RESOURCE_ELEPHANT) +
+                      huntNow +
                       currentFarmWorkers(info);
 
         bool bronze = info.civilizationStage >= CIVILIZATION_BRONZEAGE;
+        bool bronzeRush = !bronze &&
+                          info.GameFrame >= UsrAIConfig::BRONZE_RUSH_START_FRAME;
+        bool needSecondTower = countBuilding(info, BUILDING_ARROWTOWER) <
+                               UsrAIConfig::TARGET_TOWERS;
 
-        // 铜器前的核心目标是第二波前完成时代升级。
-        // 第一波结束后把大多数空闲工人压到食物，木头只维持建房/关键建筑，石头只保留少量。
-        bool bronzeRush = (!bronze && info.GameFrame >= UsrAIConfig::BRONZE_RUSH_START_FRAME);
-        int targetFood  = bronze ? max(8, landFarmers * 45 / 100)
-                                 : (bronzeRush ? max(8, landFarmers * 80 / 100)
-                                               : max(6, landFarmers * 55 / 100));
-        int targetWood  = bronze ? max(5, landFarmers * 25 / 100)
-                                 : (bronzeRush ? max(2, landFarmers * 20 / 100)
-                                               : max(3, landFarmers * 30 / 100));
+        int targetFood = bronze ? max(8, landFarmers * 45 / 100)
+                                : (bronzeRush ? max(8, landFarmers * 80 / 100)
+                                              : max(6, landFarmers * 55 / 100));
+        int targetWood = bronze ? max(5, landFarmers * 25 / 100)
+                                : (bronzeRush ? max(2, landFarmers * 20 / 100)
+                                              : max(3, landFarmers * 30 / 100));
         int targetStone = bronze ? max(2, landFarmers * 10 / 100)
-                                 : (bronzeRush ? 0 : max(1, landFarmers * 15 / 100));
-        int targetGold  = bronze ? max(3, landFarmers * 20 / 100) : 0;
+                                 : (bronzeRush
+                                    ? (needSecondTower
+                                       ? max(2, landFarmers * 20 / 100) : 0)
+                                    : max(3, landFarmers * 25 / 100));
+        int targetGold = bronze ? max(3, landFarmers * 20 / 100) : 0;
+        // 冲铜缺粮时固定抽出几名村民打猎，避免只靠浆果导致800食物来得太慢。
+        int targetHunters = bronze ? 2 : (bronzeRush ? 3 : 2);
 
         for (tagFarmer &f : info.farmers)
         {
-            if (f.FarmerSort != FARMERTYPE_FARMER || f.NowState != HUMAN_STATE_IDLE) continue;
+            if (f.FarmerSort != FARMERTYPE_FARMER ||
+                f.NowState != HUMAN_STATE_IDLE) continue;
             if (!canOrder(f.SN, info.GameFrame, 12)) continue;
 
             int targetSN = -1;
             if (foodNow < targetFood)
             {
-                targetSN = chooseFoodTarget(info, f);
+                if (huntNow < targetHunters)
+                {
+                    targetSN = chooseNearestResource(info, f, RESOURCE_GAZELLE);
+                    if (targetSN == -1 && info.GameFrame >= 6500)
+                        targetSN = chooseNearestResource(info, f, RESOURCE_ELEPHANT);
+                    if (targetSN != -1) ++huntNow;
+                }
+                if (targetSN == -1)
+                    targetSN = chooseFoodTarget(info, f);
                 if (targetSN != -1) ++foodNow;
             }
             if (targetSN == -1 && woodNow < targetWood)
@@ -348,8 +403,10 @@ namespace
                 targetSN = chooseNearestResource(info, f, RESOURCE_GOLD);
                 if (targetSN == -1) targetSN = chooseFoodTarget(info, f);
             }
-            if (targetSN == -1) targetSN = chooseNearestResource(info, f, RESOURCE_TREE);
-            if (targetSN == -1) targetSN = chooseFoodTarget(info, f);
+            if (targetSN == -1)
+                targetSN = chooseNearestResource(info, f, RESOURCE_TREE);
+            if (targetSN == -1)
+                targetSN = chooseFoodTarget(info, f);
 
             if (targetSN != -1)
             {
@@ -358,6 +415,10 @@ namespace
             }
         }
     }
+
+    // ---------- 建造与升级 ----------
+
+
 
     // ---------- 建造与升级 ----------
     bool projectFree(const tagBuilding &b)
@@ -391,6 +452,8 @@ namespace
                 ++toolComplete;
 
         if (info.civilizationStage == CIVILIZATION_TOOLAGE &&
+            info.enemy_armies.empty() &&
+            militaryCount(info) >= UsrAIConfig::PRE_BRONZE_ARMY_TARGET &&
             toolComplete >= 2 && info.Meat >= 800)
         {
             tagBuilding *center = findBuilding(info, BUILDING_CENTER);
@@ -416,6 +479,17 @@ namespace
         {
             if (tryBuild(ai, info, BUILDING_GRANARY, 120)) return;
         }
+
+        // 第一波优先防御：谷仓完成后立刻研发箭塔，并尽早建成两座。
+        // 箭塔放在基地周围可先接触敌军、吸引仇恨，避免敌人直接冲击经济区。
+        requestTech(ai, info, BUILDING_GRANARY, BUILDING_GRANARY_ARROWTOWER, 50);
+        if (info.GameFrame >= UsrAIConfig::EARLY_TOWER_FRAME &&
+            countBuilding(info, BUILDING_ARROWTOWER) < UsrAIConfig::TARGET_TOWERS &&
+            info.Stone >= 150)
+        {
+            if (tryBuild(ai, info, BUILDING_ARROWTOWER, 0, 150)) return;
+        }
+
         if (countBuilding(info, BUILDING_ARMYCAMP) == 0)
         {
             if (tryBuild(ai, info, BUILDING_ARMYCAMP, 125)) return;
@@ -430,24 +504,13 @@ namespace
         {
             if (tryBuild(ai, info, BUILDING_STABLE, 150)) return;
         }
-        // 市场+马厩已经满足升铜前置，靶场延后到铜器时代，节省150木头。
-        if (info.civilizationStage >= CIVILIZATION_BRONZEAGE &&
-            countBuilding(info, BUILDING_RANGE) == 0 && campBuilt && campBuilt->Percent >= 100)
+        // 第二波前先补靶场，工具时代即可生产弓兵，形成不同兵种共同拉仇恨。
+        if (info.civilizationStage >= CIVILIZATION_TOOLAGE &&
+            countBuilding(info, BUILDING_RANGE) == 0 &&
+            campBuilt && campBuilt->Percent >= 100)
         {
             if (tryBuild(ai, info, BUILDING_RANGE, 150)) return;
         }
-
-        // 早期解锁箭塔，第一波约 6000 帧到来。
-        requestTech(ai, info, BUILDING_GRANARY, BUILDING_GRANARY_ARROWTOWER, 50);
-
-        int earlyTowerTarget = (info.civilizationStage >= CIVILIZATION_BRONZEAGE)
-                             ? UsrAIConfig::TARGET_TOWERS : 1;
-        if (countBuilding(info, BUILDING_ARROWTOWER) < earlyTowerTarget &&
-            info.GameFrame > 2200 && info.Stone >= 150)
-        {
-            if (tryBuild(ai, info, BUILDING_ARROWTOWER, 0, 150)) return;
-        }
-
         // 铜器前不再抢先研究伐木科技：120食物+75木头会明显拖慢800食物升时代。
         // 到铜器时代后再研究。
 
@@ -455,16 +518,36 @@ namespace
         {
             if (gBronzeFrame < 0) gBronzeFrame = info.GameFrame;
 
-            // 铜器时代核心科技。先补上铜器前为了抢时代而暂缓的伐木科技。
-            requestTech(ai, info, BUILDING_MARKET, BUILDING_MARKET_WOOD_UPGRADE, 120, 75);
-            requestTech(ai, info, BUILDING_MARKET, BUILDING_MARKET_WHEEL_UPGRADE, 180, 75);
-            requestTech(ai, info, BUILDING_ARMYCAMP, BUILDING_ARMYCAMP_UPGRADE_BROADSWORD, 140, 0, 0, 50);
-            requestTech(ai, info, BUILDING_RANGE, BUILDING_RANGE_UPGRADE_COMPOSITE_BOW, 180, 100);
-            requestTech(ai, info, BUILDING_GRANARY, BUILDING_GRANARY_ARROWTOWE_UPGRADE, 120, 0, 50);
-
+            // 第二波前严格执行：学院 -> 4个方阵兵 -> 箭塔升级 -> 其他项目。
             if (countBuilding(info, BUILDING_COLLAGE) == 0)
             {
                 if (tryBuild(ai, info, BUILDING_COLLAGE, 180)) return;
+            }
+
+            if (countArmyType(info, AT_HOPLITE) < 4)
+                return; // 保留食物和黄金，由 produceArmy 连续训练方阵兵。
+
+            if (!gTechRequested.count(BUILDING_GRANARY_ARROWTOWE_UPGRADE))
+            {
+                requestTech(ai, info, BUILDING_GRANARY,
+                            BUILDING_GRANARY_ARROWTOWE_UPGRADE, 120, 0, 50);
+                return;
+            }
+
+            // 第二波马车优先由学院方阵兵处理；学院完成后再补靶场。
+            if (countBuilding(info, BUILDING_RANGE) == 0 &&
+                campBuilt && campBuilt->Percent >= 100)
+            {
+                if (tryBuild(ai, info, BUILDING_RANGE, 150)) return;
+            }
+
+            // 第二波结束前不再分散资源研究伐木、车轮、阔剑和复合弓。
+            if (info.GameFrame > UsrAIConfig::SECOND_WAVE_FRAME + 3000)
+            {
+                requestTech(ai, info, BUILDING_MARKET, BUILDING_MARKET_WOOD_UPGRADE, 120, 75);
+                requestTech(ai, info, BUILDING_MARKET, BUILDING_MARKET_WHEEL_UPGRADE, 180, 75);
+                requestTech(ai, info, BUILDING_ARMYCAMP, BUILDING_ARMYCAMP_UPGRADE_BROADSWORD, 140, 0, 0, 50);
+                requestTech(ai, info, BUILDING_RANGE, BUILDING_RANGE_UPGRADE_COMPOSITE_BOW, 180, 100);
             }
 
             // 中后期农田，解决野外食物枯竭。
@@ -495,10 +578,12 @@ namespace
                    ? UsrAIConfig::MAX_ECO_FARMERS
                    : UsrAIConfig::PRE_BRONZE_FARMERS;
 
-        // 升铜条件已经基本具备时，为 800 食物让路，不再把食物全花在村民上。
-        if (info.civilizationStage == CIVILIZATION_TOOLAGE &&
-            info.GameFrame >= UsrAIConfig::BRONZE_RUSH_START_FRAME)
-            return;
+        // 第一波后继续补村民；食物接近800升级线时才停产冲铜。
+        if (info.civilizationStage == CIVILIZATION_TOOLAGE)
+        {
+            if (info.Meat >= 650)
+                return;
+        }
 
         if (farmerCount < target && populationUsed(info) < info.Human_MaxNum && info.Meat >= 50)
         {
@@ -511,12 +596,29 @@ namespace
     int enemyPriority(const tagArmy &a)
     {
         if (a.Sort == AT_STONE_THROWER) return 1000;
-        if (a.Sort == AT_CHARIOT_ARCHER) return 900;
+        if (a.Sort == AT_CHARIOT_ARCHER) return 980;
+        if (a.Sort == AT_CHARIOT) return 950;
         if (a.Sort == AT_CAVALRY) return 800;
         if (a.Sort == AT_COMPOSITE_BOWMAN) return 750;
+        if (a.Sort == AT_BROADSWORDSMAN) return 730;
         if (a.Sort == AT_HOPLITE) return 700;
         return 500;
     }
+
+    // 第二波击杀顺序：复合弓兵 -> 普通弓兵 -> 阔剑兵 -> 战车弓 -> 方阵兵。
+    // 箭塔仍会单独优先点名两辆战车弓来拉住它们。
+    int secondWavePriority(const tagArmy &a)
+    {
+        if (a.Sort == AT_COMPOSITE_BOWMAN) return 1000;
+        if (a.Sort == AT_BOWMAN) return 980;
+        if (a.Sort == AT_BROADSWORDSMAN) return 950;
+        if (a.Sort == AT_CHARIOT_ARCHER) return 900;
+        if (a.Sort == AT_CHARIOT) return 880;
+        if (a.Sort == AT_CAVALRY) return 850;
+        if (a.Sort == AT_HOPLITE) return 700;
+        return 600;
+    }
+
 
     tagArmy* chooseEnemy(tagInfo &info)
     {
@@ -678,17 +780,108 @@ namespace
 
     void defend(UsrAI *ai, tagInfo &info)
     {
-        tagArmy *enemy = chooseEnemy(info);
-        if (!enemy) return;
+        if (info.enemy_armies.empty()) return;
 
-        // 所有可用军队集中攻击高威胁目标。
-        for (tagArmy &a : info.armies)
+        vector<tagArmy*> enemies;
+        for (tagArmy &e : info.enemy_armies) enemies.push_back(&e);
+        sort(enemies.begin(), enemies.end(),
+             [](const tagArmy *a, const tagArmy *b)
+             {
+                 int pa = secondWavePriority(*a);
+                 int pb = secondWavePriority(*b);
+                 if (pa != pb) return pa > pb;
+                 return a->SN < b->SN;
+             });
+
+        vector<tagBuilding*> towers;
+        for (tagBuilding &b : info.buildings)
+            if (b.Type == BUILDING_ARROWTOWER && b.Percent >= 100)
+                towers.push_back(&b);
+        sort(towers.begin(), towers.end(),
+             [](const tagBuilding *a, const tagBuilding *b) { return a->SN < b->SN; });
+
+        set<int> assignedEnemies;
+
+        auto orderTower = [&](tagBuilding *tower, tagArmy *target)
         {
-            if (a.Sort == AT_PRIEST) continue;
-            if (a.NowState == HUMAN_STATE_IDLE && canOrder(a.SN, info.GameFrame, 10))
+            if (!tower || !target) return;
+            assignedEnemies.insert(target->SN);
+            // tagBuilding::Project 是生产项目，不是攻击目标，不能拿它判断箭塔是否已锁敌。
+            // 只在目标变化时重发命令，让箭塔持续锁定当前敌人直到其死亡。
+            if (gCombatTargetSN[tower->SN] != target->SN &&
+                canOrder(tower->SN, info.GameFrame, 8))
             {
-                ai->HumanAction(a.SN, enemy->SN);
-                markOrdered(a.SN, info.GameFrame);
+                ai->HumanAction(tower->SN, target->SN);
+                markOrdered(tower->SN, info.GameFrame);
+                gCombatTargetSN[tower->SN] = target->SN;
+            }
+        };
+
+        auto firstEnemyOfSort = [&](int sort, bool requireUnassigned) -> tagArmy*
+        {
+            for (tagArmy *e : enemies)
+                if (e->Sort == sort &&
+                    (!requireUnassigned || !assignedEnemies.count(e->SN)))
+                    return e;
+            return nullptr;
+        };
+
+        auto firstUnassignedEnemy = [&]() -> tagArmy*
+        {
+            for (tagArmy *e : enemies)
+                if (!assignedEnemies.count(e->SN)) return e;
+            return nullptr;
+        };
+
+        // 两座箭塔分别点名两辆战车弓，不能同时集火同一辆。
+        for (tagBuilding *tower : towers)
+        {
+            tagArmy *target = firstEnemyOfSort(AT_CHARIOT_ARCHER, true);
+            if (!target) target = firstUnassignedEnemy();
+            if (!target) target = enemies.front();
+            orderTower(tower, target);
+        }
+
+        // 士兵先分别攻击尚未被拉住的敌人，各自建立仇恨；覆盖后多余士兵再集火弓兵。
+        tagArmy *killTarget = enemies.front();
+        for (tagArmy &fighter : info.armies)
+        {
+            if (fighter.Sort == AT_PRIEST) continue;
+            tagArmy *target = firstUnassignedEnemy();
+            if (!target) target = killTarget;
+            assignedEnemies.insert(target->SN);
+
+            bool changedTarget = gCombatTargetSN[fighter.SN] != target->SN;
+            bool idleRetry = fighter.NowState == HUMAN_STATE_IDLE &&
+                             canOrder(fighter.SN, info.GameFrame, 60);
+
+            // 走路追敌时绝不重复发令，否则会反复重置寻路；目标死亡后立即切换下一个。
+            if ((changedTarget || idleRetry) &&
+                canOrder(fighter.SN, info.GameFrame, 8))
+            {
+                ai->HumanAction(fighter.SN, target->SN);
+                markOrdered(fighter.SN, info.GameFrame);
+                gCombatTargetSN[fighter.SN] = target->SN;
+            }
+        }
+
+        // 第二波允许陆地村民参战：士兵先拉住仇恨，村民随后集中杀弓兵，再杀阔剑兵。
+        if (info.GameFrame >= UsrAIConfig::FIRST_WAVE_END_FRAME &&
+            info.GameFrame < UsrAIConfig::ATTACK_START_FRAME)
+        {
+            for (tagFarmer &farmer : info.farmers)
+            {
+                if (farmer.FarmerSort != FARMERTYPE_FARMER) continue;
+                bool changedTarget = gCombatTargetSN[farmer.SN] != killTarget->SN;
+                bool idleRetry = farmer.NowState == HUMAN_STATE_IDLE &&
+                                 canOrder(farmer.SN, info.GameFrame, 60);
+                if ((changedTarget || idleRetry) &&
+                    canOrder(farmer.SN, info.GameFrame, 8))
+                {
+                    ai->HumanAction(farmer.SN, killTarget->SN);
+                    markOrdered(farmer.SN, info.GameFrame);
+                    gCombatTargetSN[farmer.SN] = killTarget->SN;
+                }
             }
         }
 
@@ -700,6 +893,7 @@ namespace
         double nearestD = nearestEnemyDistanceToPriest(info, *priest, &nearest);
         int dangerRange = UsrAIConfig::PRIEST_DANGER_RANGE;
         if (nearest && (nearest->Sort == AT_CHARIOT_ARCHER ||
+                        nearest->Sort == AT_CHARIOT ||
                         nearest->Sort == AT_CAVALRY ||
                         nearest->Sort == AT_STONE_THROWER))
             dangerRange = UsrAIConfig::PRIEST_PANIC_RANGE;
@@ -716,12 +910,29 @@ namespace
             return;
         }
 
-        // 第一波阶段完全禁止祭司主动转化。任务文档明确祭司死亡直接失败，
-        // 因此宁可少拿一个敌军，也不允许祭司为了转化走到前线。
-        if (info.GameFrame < UsrAIConfig::PRIEST_EARLY_GUARD_END) return;
+        // 第二波期间祭司始终躲在箭塔/市镇中心后方，不主动转化。
+        if (info.GameFrame < UsrAIConfig::ATTACK_START_FRAME)
+        {
+            const tagBuilding *anchor = !towers.empty()
+                                      ? towers.front()
+                                      : findBuildingConst(info, BUILDING_CENTER);
+            if (anchor && blockDistance(priest->BlockDR, priest->BlockUR,
+                                        anchor->BlockDR, anchor->BlockUR) >
+                          UsrAIConfig::PRIEST_HOME_RADIUS)
+            {
+                double dr = 0.0, ur = 0.0;
+                if (findPriestSafePoint(info, *priest, dr, ur))
+                {
+                    ai->HumanMove(priest->SN, dr, ur);
+                    markOrdered(priest->SN, info.GameFrame);
+                }
+            }
+            return;
+        }
 
-        // 第二阶段以后，只有目标明显安全时才转化。
-        if (enemy && priest->ConvertCooldown <= 0)
+        // 反攻阶段以后，只有目标明显安全时才转化。
+        tagArmy *enemy = enemies.front();
+        if (priest->ConvertCooldown <= 0)
         {
             double targetD = blockDistance(priest->BlockDR, priest->BlockUR,
                                            enemy->BlockDR, enemy->BlockUR);
@@ -741,7 +952,7 @@ namespace
         if (info.enemy_armies.empty()) return false;
         if (info.GameFrame > UsrAIConfig::FIRST_WAVE_END_FRAME) return false;
 
-        // 把敌人按“离基地近 + 远程优先”排序，保证三个目标都有人打。
+        // 把敌人按“残血优先、威胁优先、离基地近”排序，避免留下最后一个敌人。
         vector<tagArmy*> enemies;
         for (tagArmy &e : info.enemy_armies) enemies.push_back(&e);
         const tagBuilding *center = findBuildingConst(info, BUILDING_CENTER);
@@ -749,8 +960,10 @@ namespace
         sort(enemies.begin(), enemies.end(),
              [center](const tagArmy *a, const tagArmy *b)
              {
+                 if (a->Blood != b->Blood) return a->Blood < b->Blood;
                  int pa = enemyPriority(*a);
                  int pb = enemyPriority(*b);
+
                  if (pa != pb) return pa > pb;
                  if (!center) return a->SN < b->SN;
                  double da = blockDistance(a->BlockDR, a->BlockUR, center->BlockDR, center->BlockUR);
@@ -761,23 +974,12 @@ namespace
         const int nEnemy = static_cast<int>(enemies.size());
         if (nEnemy == 0) return false;
 
-        // 1) 箭塔：直接 HumanAction(towerSN, enemySN)，等价于手动选箭塔后右键敌人。
-        // 每座塔选择离自己最近的敌人；只在需要切目标时补命令，避免不断重置攻击。
+        // 1) 箭塔集中攻击排序后的首要目标，快速击杀后再自动切换下一个。
         for (tagBuilding &tower : info.buildings)
         {
             if (tower.Type != BUILDING_ARROWTOWER || tower.Percent < 100) continue;
 
-            tagArmy *target = nullptr;
-            double bestD = numeric_limits<double>::max();
-            for (tagArmy *e : enemies)
-            {
-                double d = blockDistance(tower.BlockDR, tower.BlockUR, e->BlockDR, e->BlockUR);
-                if (!target || d < bestD)
-                {
-                    target = e;
-                    bestD = d;
-                }
-            }
+            tagArmy *target = enemies.front();
 
             if (target && canOrder(tower.SN, info.GameFrame, 20))
             {
@@ -805,24 +1007,7 @@ namespace
             }
         }
 
-        // 3) 所有陆地工人暂停经济，直接“右键敌人”参与围殴。
-        int workerIndex = 0;
-        for (tagFarmer &f : info.farmers)
-        {
-            if (f.FarmerSort != FARMERTYPE_FARMER) continue;
-
-            // 工人优先补到人数最少的目标；简单轮转即可保证三个敌人都有人贴身。
-            tagArmy *target = enemies[workerIndex % nEnemy];
-            ++workerIndex;
-
-            if (!(f.WorkObjectSN == target->SN && f.NowState == HUMAN_STATE_ATTACKING) &&
-                canOrder(f.SN, info.GameFrame, 18))
-            {
-                ai->HumanAction(f.SN, target->SN);
-                markOrdered(f.SN, info.GameFrame);
-            }
-        }
-
+        // 因而他们保持原采集任务，不会被攻击命令拉到前线。
         return true;
     }
 
@@ -834,12 +1019,9 @@ namespace
         int armyN = militaryCount(info);
         bool bronze = info.civilizationStage >= CIVILIZATION_BRONZEAGE;
 
-        // 铜器前留一些经济资源，但仍要在第一波前形成最低限度兵力。
+        // 铜器前优先形成多兵种防线，达到目标兵力后才开始锁800食物升铜。
         if (!bronze)
         {
-            // 冲铜开始后完全停止训练工具时代兵，锁住食物用于800食物升级。
-            if (info.GameFrame >= UsrAIConfig::BRONZE_RUSH_START_FRAME)
-                return;
             // 至少训练 1 名侦察骑兵。后续自动探索地图、发现黄金和敌方基地都依赖它。
             bool hasScout = false;
             for (const tagArmy &a : info.armies)
@@ -853,17 +1035,39 @@ namespace
                 return;
             }
 
-            if (armyN >= 5) return;
+            int targetArmy = 5;
+            if (info.GameFrame >= 7500 && info.enemy_armies.empty())
+                targetArmy = UsrAIConfig::PRE_BRONZE_ARMY_TARGET;
+            if (info.GameFrame > UsrAIConfig::FIRST_WAVE_END_FRAME &&
+                !info.enemy_armies.empty())
+                targetArmy = UsrAIConfig::SECOND_WAVE_ARMY_TARGET;
+
+            if (armyN >= targetArmy) return;
 
             tagBuilding *range = findBuilding(info, BUILDING_RANGE);
-            if (range && projectFree(*range) && info.Meat >= 40 && info.Wood >= 20)
+            int bowmen = countArmyType(info, AT_BOWMAN);
+            if (bowmen < 3 && range && projectFree(*range) &&
+                canOrder(range->SN, info.GameFrame, 2) &&
+                info.Meat >= 40 && info.Wood >= 20)
             {
                 ai->BuildingAction(range->SN, BUILDING_RANGE_CREATE_BOWMAN);
                 markOrdered(range->SN, info.GameFrame);
                 return;
             }
+
             tagBuilding *camp = findBuilding(info, BUILDING_ARMYCAMP);
-            if (camp && projectFree(*camp) && info.Meat >= 50)
+            int slingers = countArmyType(info, AT_SLINGER);
+            if (slingers < 3 && camp && projectFree(*camp) &&
+                canOrder(camp->SN, info.GameFrame, 2) &&
+                info.civilizationStage >= CIVILIZATION_TOOLAGE &&
+                info.Meat >= 40 && info.Stone >= 10)
+            {
+                ai->BuildingAction(camp->SN, BUILDING_ARMYCAMP_CREATE_SLINGER);
+                markOrdered(camp->SN, info.GameFrame);
+                return;
+            }
+            if (camp && projectFree(*camp) &&
+                canOrder(camp->SN, info.GameFrame, 2) && info.Meat >= 50)
             {
                 ai->BuildingAction(camp->SN, BUILDING_ARMYCAMP_CREATE_CLUBMAN);
                 markOrdered(camp->SN, info.GameFrame);
@@ -873,11 +1077,50 @@ namespace
 
         // 铜器时代：学院方阵兵 > 骑兵 > 复合弓/普通弓 > 阔剑。
         tagBuilding *college = findBuilding(info, BUILDING_COLLAGE);
-        if (college && projectFree(*college) && info.Meat >= 60 && info.Gold >= 40)
+        if (countArmyType(info, AT_HOPLITE) < 4 &&
+            college && projectFree(*college) &&
+            canOrder(college->SN, info.GameFrame, 2) &&
+            info.Meat >= 60 && info.Gold >= 40)
         {
             ai->BuildingAction(college->SN, BUILDING_COLLAGE_CREATE_HOPLITE);
             markOrdered(college->SN, info.GameFrame);
             return;
+        }
+
+        // 四名方阵兵到位后补三名远程单位，用于快速击杀复合弓和阔剑。
+        int bowCount = countArmyType(info, AT_BOWMAN) +
+                       countArmyType(info, AT_COMPOSITE_BOWMAN);
+        tagBuilding *range = findBuilding(info, BUILDING_RANGE);
+        if (bowCount < 3 && range && projectFree(*range) &&
+            canOrder(range->SN, info.GameFrame, 2) &&
+            info.Meat >= 40 && info.Wood >= 20)
+        {
+            ai->BuildingAction(range->SN, BUILDING_RANGE_CREATE_BOWMAN);
+            markOrdered(range->SN, info.GameFrame);
+            return;
+        }
+
+        // 方阵兵和弓兵到位后补投石兵/棍棒兵，增加不同的拉仇恨单位。
+        if (armyN < UsrAIConfig::SECOND_WAVE_ARMY_TARGET)
+        {
+            tagBuilding *camp = findBuilding(info, BUILDING_ARMYCAMP);
+            if (camp && projectFree(*camp) &&
+                canOrder(camp->SN, info.GameFrame, 2))
+            {
+                if (countArmyType(info, AT_SLINGER) < 3 &&
+                    info.Meat >= 40 && info.Stone >= 10)
+                {
+                    ai->BuildingAction(camp->SN, BUILDING_ARMYCAMP_CREATE_SLINGER);
+                    markOrdered(camp->SN, info.GameFrame);
+                    return;
+                }
+                if (info.Meat >= 50)
+                {
+                    ai->BuildingAction(camp->SN, BUILDING_ARMYCAMP_CREATE_CLUBMAN);
+                    markOrdered(camp->SN, info.GameFrame);
+                    return;
+                }
+            }
         }
 
         tagBuilding *stable = findBuilding(info, BUILDING_STABLE);
@@ -888,7 +1131,6 @@ namespace
             return;
         }
 
-        tagBuilding *range = findBuilding(info, BUILDING_RANGE);
         if (range && projectFree(*range))
         {
             if (gTechRequested.count(BUILDING_RANGE_UPGRADE_COMPOSITE_BOW) && info.Meat >= 40 && info.Gold >= 20)
@@ -1032,6 +1274,13 @@ namespace
             markOrdered(priest->SN, info.GameFrame);
         }
     }
+
+
+
+
+
+
+
 }
 
 void UsrAI::processData()
@@ -1055,7 +1304,12 @@ void UsrAI::processData()
     if (!firstWaveFighting && !info.enemy_armies.empty())
         defend(this, info);
 
-    // 3) 科技/建筑仍继续推进，尤其第一波后立刻抢800食物升铜。
+    // 3) 第二波正在交战时先下造兵命令，防止同一帧的建筑/科技先花掉军队资源。
+    bool underAttack = !info.enemy_armies.empty() && !firstWaveFighting;
+    if (underAttack)
+        produceArmy(this, info);
+
+    // 科技/建筑仍继续推进，尤其第一波后尽快抢800食物升铜。
     developBase(this, info);
     produceFarmers(this, info);
 
@@ -1065,7 +1319,8 @@ void UsrAI::processData()
 
     // 4) 持续扩军。第一波新生产的士兵下一轮会自动加入攻击；
     // 第一波后若已有基础兵力，则停止烧食物，优先第二波前进入铜器时代。
-    produceArmy(this, info);
+    if (!underAttack)
+        produceArmy(this, info);
 
     // 4) 铜器后让侦察骑兵持续开图；第三波后进入总攻流程。
     if (info.GameFrame >= UsrAIConfig::ATTACK_START_FRAME)
@@ -1073,4 +1328,5 @@ void UsrAI::processData()
     else
         explore(this, info);
 }
+
 
